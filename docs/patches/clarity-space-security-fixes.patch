@@ -1,0 +1,499 @@
+From 7c92bf1f6db55e58ab59bd9554f5ad4c5572ad2e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 1 Oct 2026 10:50:39 +0000
+Subject: [PATCH] fix(security): close cross-tenant access holes in API
+
+Fixes 9 multi-user isolation/access issues found in audit:
+
+1. Remove unauthenticated public attachment route (index.ts) that served
+   any file by predictable name; browser now loads attachments via the
+   authenticated, ownership-checked route with a ?token= param. Add path
+   containment to that route.
+2. email-webhook: drop hardcoded 'pis-webhook-2026' fallback secret.
+3. claude-notes: scope all reads/writes by user_id (+ attribute inserts).
+4. projects/reorder: constrain UPDATE to the current user.
+5. ai/search: filter tasks/meetings by user_id.
+6. ingest/status/:id: scope inbox item by user_id.
+7. OAuth /auth (google/yandex/todoist): drop ?uid= identity spoofing.
+8. tags: scope list/create/delete/link by user_id.
+9. task dependencies: verify depends_on_id ownership before linking.
+
+Frontend: add lib/attachments.ts helper to attach the auth token to
+attachment URLs at render time and strip it before saving document bodies.
+
+Builds (esbuild + vite tsc) pass; pre-existing test env failures unchanged.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0186L6QbAV4ME8XeDeh4MLgd
+---
+ .../documents/DocumentDetailPanel.tsx         |  3 +-
+ .../src/components/documents/TiptapEditor.tsx |  9 ++--
+ apps/web/src/lib/attachments.ts               | 39 ++++++++++++++++
+ packages/api/src/routes/ai.ts                 | 10 ++--
+ packages/api/src/routes/claude-notes.ts       | 46 +++++++++++++------
+ packages/api/src/routes/documents.ts          |  6 ++-
+ packages/api/src/routes/email-webhook.ts      |  5 +-
+ packages/api/src/routes/google-calendar.ts    |  8 ++--
+ packages/api/src/routes/index.ts              | 16 +++----
+ packages/api/src/routes/ingest.ts             |  5 +-
+ packages/api/src/routes/projects.ts           |  5 +-
+ packages/api/src/routes/tags.ts               | 26 +++++++----
+ packages/api/src/routes/tasks.ts              |  5 ++
+ packages/api/src/routes/todoist.ts            |  4 +-
+ packages/api/src/routes/yandex-calendar.ts    |  3 +-
+ 15 files changed, 140 insertions(+), 50 deletions(-)
+ create mode 100644 apps/web/src/lib/attachments.ts
+
+diff --git a/apps/web/src/components/documents/DocumentDetailPanel.tsx b/apps/web/src/components/documents/DocumentDetailPanel.tsx
+index 823b7fa..4eae5f1 100644
+--- a/apps/web/src/components/documents/DocumentDetailPanel.tsx
++++ b/apps/web/src/components/documents/DocumentDetailPanel.tsx
+@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react';
+ import { SlidePanel } from '../ui/SlidePanel';
+ import { apiPatch, apiGet, apiDelete, apiClient } from '../../api/client';
+ import type { Project } from '@pis/shared';
++import { attachmentUrl } from '../../lib/attachments';
+ 
+ export interface Document {
+   id: number;
+@@ -220,7 +221,7 @@ export function DocumentDetailPanel({ document, projects, onClose, onUpdated, on
+                 {attachments.map(a => (
+                   <div key={a.id} className="flex items-center gap-2 p-2 bg-gray-50 rounded-lg text-sm group">
+                     <span className="text-gray-400">📎</span>
+-                    <a href={`/v1/documents/attachments/file/${a.filename}`} target="_blank" rel="noopener noreferrer"
++                    <a href={attachmentUrl(a.filename)} target="_blank" rel="noopener noreferrer"
+                       className="text-indigo-600 hover:text-indigo-800 truncate flex-1">
+                       {a.original_name}
+                     </a>
+diff --git a/apps/web/src/components/documents/TiptapEditor.tsx b/apps/web/src/components/documents/TiptapEditor.tsx
+index 3099c28..d95902f 100644
+--- a/apps/web/src/components/documents/TiptapEditor.tsx
++++ b/apps/web/src/components/documents/TiptapEditor.tsx
+@@ -19,6 +19,7 @@ import { useDocumentsStore } from '../../store/documents.store';
+ import { useLangStore } from '../../store/lang.store';
+ import { apiClient } from '../../api/client';
+ import { documentsApi } from '../../api/documents.api';
++import { attachmentUrl, addTokenToAttachments, stripTokenFromAttachments } from '../../lib/attachments';
+ 
+ interface Props {
+   documentId: number;
+@@ -60,7 +61,7 @@ export function TiptapEditor({ documentId, initialContent, title, onTitleChange
+       });
+       const attachment = res.data?.data;
+       if (attachment?.filename) {
+-        return `/v1/documents/attachments/file/${attachment.filename}`;
++        return attachmentUrl(attachment.filename);
+       }
+     } catch (err) {
+       console.warn('Image upload failed:', err);
+@@ -81,7 +82,7 @@ export function TiptapEditor({ documentId, initialContent, title, onTitleChange
+     const ed = editorRef.current;
+     if (ed) {
+       setSaving(true);
+-      await updateDocument(docIdRef.current, { body: ed.getHTML() });
++      await updateDocument(docIdRef.current, { body: stripTokenFromAttachments(ed.getHTML()) });
+       setLastSaved(new Date().toISOString());
+       setSaving(false);
+     }
+@@ -181,7 +182,7 @@ export function TiptapEditor({ documentId, initialContent, title, onTitleChange
+           },
+         }),
+       ],
+-      content: initialContent,
++      content: addTokenToAttachments(initialContent),
+       editorProps: {
+         attributes: {
+           class: 'prose prose-sm dark:prose-invert max-w-none focus:outline-none min-h-[400px] px-8 py-4',
+@@ -231,7 +232,7 @@ export function TiptapEditor({ documentId, initialContent, title, onTitleChange
+         },
+       },
+       onUpdate: ({ editor: ed }) => {
+-        saveContent(ed.getHTML());
++        saveContent(stripTokenFromAttachments(ed.getHTML()));
+       },
+     },
+     [documentId],
+diff --git a/apps/web/src/lib/attachments.ts b/apps/web/src/lib/attachments.ts
+new file mode 100644
+index 0000000..373e0db
+--- /dev/null
++++ b/apps/web/src/lib/attachments.ts
+@@ -0,0 +1,39 @@
++// Attachment files are served by an authenticated, ownership-checked API route.
++// Browser <img>/<a> can't send an Authorization header, so we pass the JWT as a
++// `?token=` query param (accepted by the API's authMiddleware). The token is
++// NEVER persisted into document content: it is added at render time and stripped
++// before saving.
++
++const ATTACH_PATH = '/v1/documents/attachments/file/';
++
++function currentToken(): string {
++  try {
++    return localStorage.getItem('auth_token') || '';
++  } catch {
++    return '';
++  }
++}
++
++/** Build a ready-to-use (authenticated) URL for a single attachment filename. */
++export function attachmentUrl(filename: string): string {
++  return `${ATTACH_PATH}${encodeURIComponent(filename)}?token=${encodeURIComponent(currentToken())}`;
++}
++
++// Matches an attachment URL in HTML (src/href), with an optional existing query string.
++const ATTACH_URL_RE = new RegExp(
++  `(${ATTACH_PATH.replace(/[/]/g, '\\/')}[^"'?\\s]+)(\\?[^"'\\s]*)?`,
++  'g',
++);
++
++/** Add the current auth token to every attachment URL in an HTML string (for display). */
++export function addTokenToAttachments(html: string): string {
++  if (!html) return html;
++  const token = currentToken();
++  return html.replace(ATTACH_URL_RE, (_m, base) => `${base}?token=${encodeURIComponent(token)}`);
++}
++
++/** Remove any token query string from attachment URLs (before persisting). */
++export function stripTokenFromAttachments(html: string): string {
++  if (!html) return html;
++  return html.replace(ATTACH_URL_RE, (_m, base) => base);
++}
+diff --git a/packages/api/src/routes/ai.ts b/packages/api/src/routes/ai.ts
+index b69a271..202b14b 100644
+--- a/packages/api/src/routes/ai.ts
++++ b/packages/api/src/routes/ai.ts
+@@ -118,8 +118,8 @@ aiRouter.post('/voice-command', async (req: AuthRequest, res: Response) => {
+     const claudeMatch = parsed.data.text.match(/^(клод|claude)[:\s,-]+([\s\S]+)$/i);
+     if (claudeMatch) {
+       const content = claudeMatch[2].trim();
+-      db.prepare('INSERT INTO claude_notes (content, source) VALUES (?, ?)').run(content, 'web');
+-      const pending = (db.prepare('SELECT COUNT(*) as c FROM claude_notes WHERE processed = 0').get() as { c: number }).c;
++      db.prepare('INSERT INTO claude_notes (content, source, user_id) VALUES (?, ?, ?)').run(content, 'web', userId);
++      const pending = (db.prepare(`SELECT COUNT(*) as c FROM claude_notes WHERE processed = 0${userFilter}`).get(...userParams) as { c: number }).c;
+       res.json(ok({
+         actions: [],
+         results: [],
+@@ -678,9 +678,11 @@ aiRouter.post('/productivity-analysis', async (req: AuthRequest, res: Response)
+ aiRouter.get('/search', async (req: AuthRequest, res: Response) => {
+   const q = req.query['q'];
+   if (typeof q !== 'string' || !q) { res.status(400).json(fail('Query parameter q is required')); return; }
++  const userId = getUserId(req);
++  if (userId === null) { res.status(401).json(fail('Authentication required')); return; }
+   try {
+-    const tasks = getDb().prepare("SELECT title FROM tasks WHERE title LIKE ? LIMIT 10").all(`%${q}%`);
+-    const meetings = getDb().prepare("SELECT title, summary_raw FROM meetings WHERE title LIKE ? OR summary_raw LIKE ? LIMIT 5").all(`%${q}%`, `%${q}%`);
++    const tasks = getDb().prepare("SELECT title FROM tasks WHERE title LIKE ? AND user_id = ? LIMIT 10").all(`%${q}%`, userId);
++    const meetings = getDb().prepare("SELECT title, summary_raw FROM meetings WHERE (title LIKE ? OR summary_raw LIKE ?) AND user_id = ? LIMIT 5").all(`%${q}%`, `%${q}%`, userId);
+     const result = await claude.searchKnowledge(q, JSON.stringify({ tasks, meetings }));
+     res.json(ok(result));
+   } catch (err) {
+diff --git a/packages/api/src/routes/claude-notes.ts b/packages/api/src/routes/claude-notes.ts
+index 2cb7cb0..52910ca 100644
+--- a/packages/api/src/routes/claude-notes.ts
++++ b/packages/api/src/routes/claude-notes.ts
+@@ -1,7 +1,9 @@
+-import { Router, Request, Response } from 'express';
++import { Router, Response } from 'express';
+ import { z } from 'zod';
+ import { queryAll, queryOne, execute } from '../db/db';
+ import { ok, fail } from '@pis/shared';
++import type { AuthRequest } from '../middleware/auth';
++import { getUserId } from '../middleware/user-scope';
+ 
+ export const claudeNotesRouter = Router();
+ 
+@@ -10,43 +12,59 @@ const CreateSchema = z.object({
+   source: z.string().optional().default('api'),
+ });
+ 
+-claudeNotesRouter.get('/', async (req: Request, res: Response) => {
++claudeNotesRouter.get('/', async (req: AuthRequest, res: Response) => {
++  const userId = getUserId(req);
++  if (userId === null) { res.status(401).json(fail('Authentication required')); return; }
+   const onlyPending = req.query['pending'] === 'true';
+   const sql = onlyPending
+-    ? 'SELECT * FROM claude_notes WHERE processed = 0 ORDER BY created_at DESC'
+-    : 'SELECT * FROM claude_notes ORDER BY created_at DESC LIMIT 100';
+-  const notes = await queryAll(sql);
++    ? 'SELECT * FROM claude_notes WHERE processed = 0 AND user_id = $1 ORDER BY created_at DESC'
++    : 'SELECT * FROM claude_notes WHERE user_id = $1 ORDER BY created_at DESC LIMIT 100';
++  const notes = await queryAll(sql, [userId]);
+   res.json(ok(notes));
+ });
+ 
+-claudeNotesRouter.post('/', async (req: Request, res: Response) => {
++claudeNotesRouter.post('/', async (req: AuthRequest, res: Response) => {
++  const userId = getUserId(req);
++  if (userId === null) { res.status(401).json(fail('Authentication required')); return; }
+   const parsed = CreateSchema.safeParse(req.body);
+   if (!parsed.success) { res.status(400).json(fail(parsed.error.message)); return; }
+   const { content, source } = parsed.data;
+   const inserted = await queryOne<{ id: number }>(
+-    'INSERT INTO claude_notes (content, source) VALUES ($1, $2) RETURNING id',
+-    [content, source]
++    'INSERT INTO claude_notes (content, source, user_id) VALUES ($1, $2, $3) RETURNING id',
++    [content, source, userId]
+   );
+   if (!inserted) { res.status(500).json(fail('Insert failed')); return; }
+-  const note = await queryOne('SELECT * FROM claude_notes WHERE id = $1', [inserted.id]);
++  const note = await queryOne('SELECT * FROM claude_notes WHERE id = $1 AND user_id = $2', [inserted.id, userId]);
+   res.status(201).json(ok(note));
+ });
+ 
+-claudeNotesRouter.patch('/:id', async (req: Request, res: Response) => {
++claudeNotesRouter.patch('/:id', async (req: AuthRequest, res: Response) => {
++  const userId = getUserId(req);
++  if (userId === null) { res.status(401).json(fail('Authentication required')); return; }
+   const id = Number(req.params['id']);
++  // Ownership check: only touch rows that belong to this user.
++  const existing = await queryOne('SELECT id FROM claude_notes WHERE id = $1 AND user_id = $2', [id, userId]);
++  if (!existing) { res.status(404).json(fail('Note not found')); return; }
+   const { processed, vault_path } = req.body;
+   const fields: string[] = [];
+   const values: unknown[] = [];
+   if (processed !== undefined) { fields.push(`processed = $${fields.length + 1}`); values.push(processed ? true : false); }
+   if (vault_path !== undefined) { fields.push(`vault_path = $${fields.length + 1}`); values.push(vault_path); }
+   if (fields.length === 0) { res.status(400).json(fail('No fields')); return; }
+-  await execute(`UPDATE claude_notes SET ${fields.join(', ')} WHERE id = $${values.length + 1}`, [...values, id]);
+-  const note = await queryOne('SELECT * FROM claude_notes WHERE id = $1', [id]);
++  await execute(
++    `UPDATE claude_notes SET ${fields.join(', ')} WHERE id = $${values.length + 1} AND user_id = $${values.length + 2}`,
++    [...values, id, userId]
++  );
++  const note = await queryOne('SELECT * FROM claude_notes WHERE id = $1 AND user_id = $2', [id, userId]);
+   res.json(ok(note));
+ });
+ 
+-claudeNotesRouter.delete('/:id', async (req: Request, res: Response) => {
++claudeNotesRouter.delete('/:id', async (req: AuthRequest, res: Response) => {
++  const userId = getUserId(req);
++  if (userId === null) { res.status(401).json(fail('Authentication required')); return; }
+   const id = Number(req.params['id']);
+-  await execute('DELETE FROM claude_notes WHERE id = $1', [id]);
++  const existing = await queryOne('SELECT id FROM claude_notes WHERE id = $1 AND user_id = $2', [id, userId]);
++  if (!existing) { res.status(404).json(fail('Note not found')); return; }
++  await execute('DELETE FROM claude_notes WHERE id = $1 AND user_id = $2', [id, userId]);
+   res.json(ok({ deleted: true }));
+ });
+diff --git a/packages/api/src/routes/documents.ts b/packages/api/src/routes/documents.ts
+index ceaba8c..973b6e4 100644
+--- a/packages/api/src/routes/documents.ts
++++ b/packages/api/src/routes/documents.ts
+@@ -107,7 +107,11 @@ documentsRouter.get('/attachments/file/:filename', (req: AuthRequest, res: Respo
+   // Verify the attachment belongs to a document owned by this user
+   const att = getDb().prepare('SELECT a.id FROM attachments a JOIN documents d ON d.id = a.document_id WHERE a.filename = ? AND d.user_id = ?').get(req.params['filename']!, userId);
+   if (!att) { res.status(404).json(fail('Файл не найден')); return; }
+-  const filePath = path.join(attachDir, req.params['filename']!);
++  // Defense in depth: ensure the resolved path stays inside attachDir (no `../` traversal)
++  const filePath = path.resolve(attachDir, req.params['filename']!);
++  if (filePath !== attachDir && !filePath.startsWith(attachDir + path.sep)) {
++    res.status(404).json(fail('Файл не найден')); return;
++  }
+   if (!fs.existsSync(filePath)) { res.status(404).json(fail('Файл не найден')); return; }
+   res.sendFile(filePath);
+ });
+diff --git a/packages/api/src/routes/email-webhook.ts b/packages/api/src/routes/email-webhook.ts
+index 435013d..58765d4 100644
+--- a/packages/api/src/routes/email-webhook.ts
++++ b/packages/api/src/routes/email-webhook.ts
+@@ -8,7 +8,10 @@ export const emailWebhookRouter = Router();
+ // Works with: Zapier, Make.com, n8n, or direct webhook
+ emailWebhookRouter.post('/', async (req: Request, res: Response) => {
+   const secret = req.query['token'] || req.headers['x-webhook-secret'];
+-  if (secret !== process.env['WEBHOOK_SECRET'] && secret !== 'pis-webhook-2026') {
++  const expected = process.env['WEBHOOK_SECRET'];
++  // Require a configured secret; no hardcoded fallback (the old default leaked
++  // via the public repo and let anyone write tasks into any account).
++  if (!expected || secret !== expected) {
+     res.status(403).json(fail('Invalid webhook token'));
+     return;
+   }
+diff --git a/packages/api/src/routes/google-calendar.ts b/packages/api/src/routes/google-calendar.ts
+index 9909b73..94e7a52 100644
+--- a/packages/api/src/routes/google-calendar.ts
++++ b/packages/api/src/routes/google-calendar.ts
+@@ -33,9 +33,11 @@ googleCalendarRouter.get('/auth', (req: AuthRequest, res: Response) => {
+   const clientId = config.googleClientId;
+   if (!clientId) { res.status(400).json(fail('GOOGLE_CLIENT_ID not configured')); return; }
+ 
+-  // Get user_id from JWT or query param
+-  const userId = getUserId(req) || (req.query['uid'] ? Number(req.query['uid']) : null);
+-  if (!userId) { res.status(401).json(fail('Not authenticated. Add ?uid=YOUR_USER_ID')); return; }
++  // Identify the user from the authenticated session only (JWT via header or
++  // ?token=). The old ?uid= fallback let anyone start OAuth for an arbitrary
++  // user id and bind their calendar into the victim's account.
++  const userId = getUserId(req);
++  if (!userId) { res.status(401).json(fail('Not authenticated')); return; }
+ 
+   const redirectUri = `${config.webappUrl}/v1/google-calendar/callback`;
+   const state = jwt.sign({ userId }, config.jwtSecret, { expiresIn: '10m' });
+diff --git a/packages/api/src/routes/index.ts b/packages/api/src/routes/index.ts
+index 3e78d65..9a71f97 100644
+--- a/packages/api/src/routes/index.ts
++++ b/packages/api/src/routes/index.ts
+@@ -1,7 +1,4 @@
+ import { Router } from 'express';
+-import * as fs from 'fs';
+-import * as path from 'path';
+-import { config } from '../config';
+ import { projectsRouter } from './projects';
+ import { tasksRouter } from './tasks';
+ import { meetingsRouter } from './meetings';
+@@ -37,13 +34,12 @@ router.use('/google-calendar', googleCalendarRouter);
+ router.use('/todoist', todoistRouter);
+ router.use('/yandex-calendar', yandexCalendarRouter);
+ 
+-// Public: serve attachment files (images in documents) without auth — filenames are random/unguessable
+-router.get('/documents/attachments/file/:filename', (req, res) => {
+-  const attachDir = path.join(config.vaultPath, 'Attachments');
+-  const filePath = path.join(attachDir, req.params['filename']!);
+-  if (!fs.existsSync(filePath)) { res.status(404).json({ success: false, error: 'File not found' }); return; }
+-  res.sendFile(filePath);
+-});
++// NOTE: attachment files are served by the authenticated, ownership-checked
++// route in documents.ts (`GET /documents/attachments/file/:filename`). The
++// previous public route here served ANY file in the Attachments dir with no
++// auth and no user scoping (predictable `${docId}-${ts}` filenames + path
++// traversal) — removed. Browser <img>/<a> load attachments with a `?token=`
++// query param, which authMiddleware accepts.
+ 
+ // All routes below require authentication
+ router.use(requireAuth);
+diff --git a/packages/api/src/routes/ingest.ts b/packages/api/src/routes/ingest.ts
+index 5b9187a..a061d9a 100644
+--- a/packages/api/src/routes/ingest.ts
++++ b/packages/api/src/routes/ingest.ts
+@@ -57,7 +57,10 @@ ingestRouter.post('/', upload.single('file'), async (req: AuthRequest, res: Resp
+ });
+ 
+ ingestRouter.get('/status/:id', (req: AuthRequest, res: Response) => {
+-  const item = ingestService.getStatus(Number(req.params['id']));
++  const userId = getUserId(req);
++  if (userId == null) { res.status(401).json(fail('Authentication required')); return; }
++  // Scope to the current user so B cannot read A's inbox item by id.
++  const item = getDb().prepare('SELECT * FROM inbox_items WHERE id = ? AND user_id = ?').get(Number(req.params['id']), userId);
+   if (!item) { res.status(404).json(fail('Inbox item not found')); return; }
+   res.json(ok(item));
+ });
+diff --git a/packages/api/src/routes/projects.ts b/packages/api/src/routes/projects.ts
+index c9ba89b..851af15 100644
+--- a/packages/api/src/routes/projects.ts
++++ b/packages/api/src/routes/projects.ts
+@@ -68,8 +68,11 @@ projectsRouter.get('/', async (req: AuthRequest, res: Response) => {
+ projectsRouter.patch('/reorder', async (req: AuthRequest, res: Response) => {
+   const parsed = z.array(z.object({ id: z.number(), order_index: z.number() })).safeParse(req.body);
+   if (!parsed.success) { res.status(400).json(fail(parsed.error.message)); return; }
++  const uid = getUserId(req);
++  if (uid === null) { res.status(401).json(fail('Authentication required')); return; }
+   for (const { id, order_index } of parsed.data) {
+-    await execute('UPDATE projects SET order_index = $1 WHERE id = $2', [order_index, id]);
++    // Scope to the current user so B cannot reorder A's projects.
++    await execute('UPDATE projects SET order_index = $1 WHERE id = $2 AND user_id = $3', [order_index, id, uid]);
+   }
+   const scope = userScopeWhere(req);
+   const projects = await queryAll(
+diff --git a/packages/api/src/routes/tags.ts b/packages/api/src/routes/tags.ts
+index b72322f..37ba099 100644
+--- a/packages/api/src/routes/tags.ts
++++ b/packages/api/src/routes/tags.ts
+@@ -12,27 +12,35 @@ const CreateTagSchema = z.object({
+   color: z.string().optional().default('#6366f1'),
+ });
+ 
+-// GET /tags — list all tags
+-tagsRouter.get('/', (_req: AuthRequest, res: Response) => {
+-  const tags = getDb().prepare('SELECT * FROM tags ORDER BY name').all();
++// GET /tags — list this user's tags
++tagsRouter.get('/', (req: AuthRequest, res: Response) => {
++  const userId = getUserId(req);
++  if (userId == null) { res.status(401).json(fail('Authentication required')); return; }
++  const tags = getDb().prepare('SELECT * FROM tags WHERE user_id = ? ORDER BY name').all(userId);
+   res.json(ok(tags));
+ });
+ 
+-// POST /tags — create tag
++// POST /tags — create tag owned by this user
+ tagsRouter.post('/', (req: AuthRequest, res: Response) => {
++  const userId = getUserId(req);
++  if (userId == null) { res.status(401).json(fail('Authentication required')); return; }
+   const parsed = CreateTagSchema.safeParse(req.body);
+   if (!parsed.success) { res.status(400).json(fail(parsed.error.message)); return; }
+   const { name, color } = parsed.data;
+-  const result = getDb().prepare('INSERT INTO tags (name, color) VALUES (?, ?)').run(name, color);
+-  const tag = getDb().prepare('SELECT * FROM tags WHERE id = ?').get(result.lastInsertRowid);
++  const result = getDb().prepare('INSERT INTO tags (name, color, user_id) VALUES (?, ?, ?)').run(name, color, userId);
++  const tag = getDb().prepare('SELECT * FROM tags WHERE id = ? AND user_id = ?').get(result.lastInsertRowid, userId);
+   res.status(201).json(ok(tag));
+ });
+ 
+-// DELETE /tags/:id — delete tag
++// DELETE /tags/:id — delete only this user's tag (and its task links)
+ tagsRouter.delete('/:id', (req: AuthRequest, res: Response) => {
++  const userId = getUserId(req);
++  if (userId == null) { res.status(401).json(fail('Authentication required')); return; }
+   const tagId = Number(req.params['id']);
++  const tag = getDb().prepare('SELECT id FROM tags WHERE id = ? AND user_id = ?').get(tagId, userId);
++  if (!tag) { res.status(404).json(fail('Tag not found')); return; }
+   getDb().prepare('DELETE FROM task_tags WHERE tag_id = ?').run(tagId);
+-  getDb().prepare('DELETE FROM tags WHERE id = ?').run(tagId);
++  getDb().prepare('DELETE FROM tags WHERE id = ? AND user_id = ?').run(tagId, userId);
+   res.json(ok({ deleted: true }));
+ });
+ 
+@@ -43,6 +51,8 @@ tagsRouter.post('/tasks/:taskId/tags/:tagId', (req: AuthRequest, res: Response)
+   const userId = getUserId(req);
+   const task = getDb().prepare('SELECT id FROM tasks WHERE id = ? AND user_id = ?').get(taskId, userId);
+   if (!task) { res.status(404).json(fail('Task not found')); return; }
++  const tag = getDb().prepare('SELECT id FROM tags WHERE id = ? AND user_id = ?').get(tagId, userId);
++  if (!tag) { res.status(404).json(fail('Tag not found')); return; }
+   try {
+     getDb().prepare('INSERT OR IGNORE INTO task_tags (task_id, tag_id) VALUES (?, ?)').run(taskId, tagId);
+     res.json(ok({ linked: true }));
+diff --git a/packages/api/src/routes/tasks.ts b/packages/api/src/routes/tasks.ts
+index 3130def..f11c342 100644
+--- a/packages/api/src/routes/tasks.ts
++++ b/packages/api/src/routes/tasks.ts
+@@ -333,6 +333,11 @@ tasksRouter.post('/:id/dependencies', (req: AuthRequest, res: Response) => {
+   const { depends_on_id } = req.body;
+   if (!depends_on_id || typeof depends_on_id !== 'number') { res.status(400).json(fail('depends_on_id required')); return; }
+   if (depends_on_id === taskId) { res.status(400).json(fail('Cannot depend on itself')); return; }
++  // The dependency target must also belong to this user, else B could link to
++  // (and then read via GET) A's task by id.
++  const depUserId = getUserId(req);
++  const target = getDb().prepare('SELECT id FROM tasks WHERE id = ? AND user_id = ?').get(depends_on_id, depUserId);
++  if (!target) { res.status(404).json(fail('Dependency task not found')); return; }
+   try {
+     getDb().prepare('INSERT OR IGNORE INTO task_dependencies (task_id, depends_on_id) VALUES (?, ?)').run(taskId, depends_on_id);
+     res.json(ok({ task_id: taskId, depends_on_id }));
+diff --git a/packages/api/src/routes/todoist.ts b/packages/api/src/routes/todoist.ts
+index 68d87a2..92041d2 100644
+--- a/packages/api/src/routes/todoist.ts
++++ b/packages/api/src/routes/todoist.ts
+@@ -64,7 +64,9 @@ async function todoistFetch(token: string, path: string, options?: RequestInit):
+ 
+ todoistRouter.get('/auth', (req: AuthRequest, res: Response) => {
+   if (!config.todoistClientId) { res.status(400).json(fail('TODOIST_CLIENT_ID not configured')); return; }
+-  const userId = getUserId(req) || (req.query['uid'] ? Number(req.query['uid']) : null);
++  // Authenticated session only — no ?uid= fallback (it allowed binding a
++  // Todoist token into an arbitrary victim account).
++  const userId = getUserId(req);
+   if (!userId) { res.status(401).json(fail('Not authenticated')); return; }
+   const state = jwt.sign({ userId }, config.jwtSecret, { expiresIn: '10m' });
+   const redirectUri = `${config.webappUrl}/v1/todoist/callback`;
+diff --git a/packages/api/src/routes/yandex-calendar.ts b/packages/api/src/routes/yandex-calendar.ts
+index 29b585c..894aa44 100644
+--- a/packages/api/src/routes/yandex-calendar.ts
++++ b/packages/api/src/routes/yandex-calendar.ts
+@@ -61,7 +61,8 @@ async function getYandexToken(userId: number): Promise<string | null> {
+ 
+ yandexCalendarRouter.get('/auth', (req: AuthRequest, res: Response) => {
+   if (!config.yandexClientId) { res.status(400).json(fail('YANDEX_CLIENT_ID not configured')); return; }
+-  const userId = getUserId(req) || (req.query['uid'] ? Number(req.query['uid']) : null);
++  // Authenticated session only — no ?uid= fallback (identity spoofing).
++  const userId = getUserId(req);
+   if (!userId) { res.status(401).json(fail('Not authenticated')); return; }
+   const state = jwt.sign({ userId }, config.jwtSecret, { expiresIn: '10m' });
+   const redirectUri = `${config.webappUrl}/v1/yandex-calendar/callback`;
+-- 
+2.43.0
+
